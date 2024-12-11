@@ -47,19 +47,20 @@ object Endpoint extends Logging {
 			rws => ZIO.attemptBlocking(rws.close).orDie)
 
 		val createReq = ZIO.fromCompletionStage(
-				client.request( RequestOptions(uri)).toCompletionStage )
-					//.compose( r =>
-		def send(r: HttpClientRequest) = ZIO.fromCompletionStage(
-				r.send.expecting(SC_OK).toCompletionStage )
-			///.compose( r =>
-		def pipeTo(r: HttpClientResponse) = ZIO.fromCompletionStage (
-				r.pipeTo(rws).toCompletionStage	)
+				client.request( RequestOptions(uri)).toCompletionStage
+		)
+
+		def sendNPipe(r: HttpClientRequest, rws: ReactiveWriteStream[Buffer]) = ZIO.fromCompletionStage{
+			val resp = r.send.expecting(SC_OK)
+			resp.compose( _.pipeTo(rws))
+				.compose(_ => resp).toCompletionStage
+		}
 
 		def res(is: InputStream) = ZIO.attempt {
 			readFromStream(is)
 		}
 
-		def log(req: HttpClientRequest, resp: HttpClientResponse, result: Either[Throwable, String], logFileName: String) = {
+		def log(req: HttpClientRequest, resp: HttpClientResponse, result: Either[Throwable, String], logFileName: String): Unit = {
 			val l = s"$req: $resp"
 			result.fold(e => {
 					logger.error(l + e.getMessage, e)
@@ -68,29 +69,30 @@ object Endpoint extends Logging {
 					logger.debug(l + r)
 				})
 		}
-
+		var logPrefix = ""
 		Unsafe.unsafe { implicit u =>
 			unsafe.runToFuture {
 				ZIO.scoped {
 					for {
 						rws <- rwsZIO
 						req <- createReq
-						resp <- send(req)
-						is <- rws.toZIOStream(2) // FIXME Handle non UTF-8 encoding
+						is <- rws.toZIOStream(2) // FIXME Handle non UTF-8 encoding (resp needed)
 							.mapConcatChunk(b => Chunk.fromArray(b.getBytes)) // Makes copy!!
-//							.tapSink(ZSink.fromFileName(logFileName))
-//							.tapSink(ZSink.take(512).map(c =>
-//												log(req, resp, Right(new String(c.toArray, "UTF-8")), logFileName))) // Truncated log
+							.tapSink(ZSink.fromFileName(logFileName)) // Log the whole response
+							.tapSink(ZSink.take(512).map(c => logPrefix = new String(c.toArray, "UTF-8"))) // Truncated log
 							.toInputStream
-						r <- pipeTo(resp) &> res(is)
+						r <- sendNPipe(req, rws) <&> res(is)
 						//r <- createReq &> res(is)
-					} yield r
+					} yield  (r,req)
 				}.mapErrorCause { t =>
 					//log(req, resp, Left(t), logFileName)
 					//ZIO.attempt{
 					logger.error("Error: " + t.prettyPrint)
 					//}
 					t
+				}.map{case ((resp, r: Result), req) =>
+					log(req, resp, Right(logPrefix), logFileName)
+					r
 				}
 			}//.getOrThrowFiberFailure()
 		}
