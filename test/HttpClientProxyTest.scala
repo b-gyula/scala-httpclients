@@ -1,19 +1,20 @@
+import com.comcast.ip4s.{Host, Port}
 
 import org.scalatest.matchers.must.Matchers
 import org.scalatest.EitherValues._
-import org.scalatest.concurrent.{Futures, ScalaFutures, Waiters}
+import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.wordspec.AsyncWordSpec
 
-import java.io.{IOException, InputStream}
+import java.io.IOException
 import java.util
-import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
 import scala.language.{implicitConversions, postfixOps}
 import play.api.Logging
 import sttp.client3.UriContext
 import sttp.model.Uri
-
-import java.net.URI
+import scala.jdk.FutureConverters._
+import java.net.{InetSocketAddress, URI}
+import java.net.InetSocketAddress.createUnresolved
 
 class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures with Logging {
 	val expectedIP = "144.21.33.32"
@@ -21,6 +22,26 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 	val proxyHost = "127.0.0.1"
 	val apifyUrl = uri"http://api.ipify.org"
 	implicit def uriToString(uri: Uri): String = uri.toString
+
+	"Armeria" in {
+		import com.linecorp.armeria.client._
+		import com.linecorp.armeria.client.proxy.ProxyConfig.socks5
+		import com.linecorp.armeria.common._
+		import com.linecorp.armeria.common.HttpMethod.GET
+		val factory =
+			ClientFactory.builder
+				.proxyConfig(socks5(new InetSocketAddress(proxyHost, proxyPort)))
+				.build
+		val client = WebClient
+			.builder(apifyUrl)
+			.factory(factory)
+			.maxResponseLength(40*1024*1024)
+			.build
+		val req = HttpRequest.of(GET, "/")
+		client.execute(req)
+			.aggregate.asScala
+			.map( _.contentUtf8 mustBe expectedIP)
+	}
 
 	"Vertx" must { // OK https://www.techempower.com/benchmarks/#section=test&shareid=06639089-9b3f-4b71-b8f1-9a302df69d66&
 		import io.vertx.core.buffer.Buffer
@@ -100,7 +121,7 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 		//		} yield dom
 		val prg = for {
 			client <- ZIO.serviceWith[Client](_.uri(new URI(apifyUrl))
-				.proxy(Proxy(url"socks5://$proxyHost:$proxyPort")) // DOES NOT WORK
+				.proxy(Proxy(url"socks://$proxyHost:$proxyPort")) // DOES NOT WORK
 				.batched)
 			r <- client(Request(method = GET))
 		} yield r.body.asString
@@ -112,7 +133,6 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 				.getOrThrowFiberFailure mustBe expectedIP
 		}
 	}
-
 
 /*	"Armeria" must {
 
@@ -154,8 +174,7 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 		import sttp.model.Uri
 		import sttp.client3.SttpBackendOptions.ProxyType.Socks
 		import scala.concurrent.{Await, Future}
-		val options = SttpBackendOptions(
-			3.seconds,
+		val options = SttpBackendOptions( 3.seconds,
 			Some(SttpBackendOptions.Proxy(proxyHost, proxyPort, Socks)))
 
 		val request = basicRequest.get(apifyUrl)
@@ -163,6 +182,11 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 					val r = sttpBackend.send(request)
 					r.body mustBe expectedIP
 				}*/
+
+		def check(backend: SttpBackend[Future, ?]) = {
+			backend
+				.send(request).map{ _.body.value mustBe expectedIP }
+		}
 
 		"simple" in {
 			quick.backend
@@ -179,11 +203,6 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 				.send(request).body.value mustBe expectedIP
 		}
 
-		def check(backend: SttpBackend[Future, ?]) = {
-			backend
-				.send(request).map{ _.body.value mustBe expectedIP }
-		}
-
 /*		"AkkaHttpBackend" in {
 			import sttp.client3.akkahttp._
 			check(AkkaHttpBackend())
@@ -194,22 +213,37 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 			check(PekkoHttpBackend(options))
 		}
 
-		"ArmeriaBackend" in { // OK
+		"ArmeriaFutureBackend" in { // OK
 			import sttp.client3.armeria._
 			import future.ArmeriaFutureBackend
-			import ArmeriaWebClient.newClient
-			import com.linecorp.armeria.client.WebClientBuilder
-//			val cli = newClient(options, new WebClientBuilder().build
 			check(ArmeriaFutureBackend(options))
 		}
 
 		"OKHttp" must {
 			"sync" in { // OK
-				import sttp.client3.okhttp.OkHttpSyncBackend
+				import okhttp.OkHttpSyncBackend
 				OkHttpSyncBackend(options)
 					.send(request).body.value mustBe expectedIP
 			}
 		}
+
+
+	}
+
+	"http4s" in {
+		import cats.effect.IO
+		import cats.effect.unsafe.implicits._
+		import org.http4s.netty.client.Socks5
+		import org.http4s.netty.client.NettyClientBuilder
+
+		NettyClientBuilder[IO]
+			.withProxy(Socks5(Host.fromString(proxyHost).get,
+				Port.fromInt(proxyPort).get))
+			.resource
+			.use(
+				_.expect[String](apifyUrl)
+			).unsafeToFuture
+			.map(_ mustBe expectedIP)
 	}
 
 	"play-ws" in { // OK
