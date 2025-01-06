@@ -25,6 +25,7 @@ object httpclient extends RootModule with PlayApiModule// with ScalafixModule //
 	override
 	def scalacOptions = scalaOptions
 
+	def mainClass = Some("VertXHttpClientStreamTest.withZIO")
 	import coursier.maven.MavenRepository
 
 	override
@@ -61,6 +62,7 @@ object httpclient extends RootModule with PlayApiModule// with ScalafixModule //
 		, ivy"com.typesafe.akka::akka-http:10.5.3"
 		, ivy"com.typesafe.akka::akka-actor-typed:$akkaVer"
 		, ivy"com.typesafe.akka::akka-stream:$akkaVer"
+		, ivy"com.typesafe.akka::akka-serialization-jackson:$akkaVer"
 		, ivy"dev.zio::zio-http:3.0.0"
 		, ivy"dev.zio::zio-interop-reactivestreams:2.0.2"
 		, ivy"io.vertx:vertx-web-client:$vertxVer"
@@ -72,8 +74,9 @@ object httpclient extends RootModule with PlayApiModule// with ScalafixModule //
 		, ivy"org.jboss.resteasy:resteasy-client-vertx:6.2.10.Final"
 		, ivy"com.github.cloudonix:vertx-java.io:1.4.0"
 		, ivy"org.aspectj:aspectjrt:${aspectjVersion()}" // `cause
-		,ivy"org.aspectj:aspectjweaver:${aspectjVersion()}"
-
+		, ivy"org.aspectj:aspectjweaver:${aspectjVersion()}"
+		, ivy"org.scalaz::scalaz-core:7.3.8"
+		, ivy"com.softwaremill.sttp.client3::jsoniter:3.10.2"
 	) ++ aspectjToolsDeps() //++ super.ivyDeps()
 
 	override def runIvyDeps = super.runIvyDeps() ++ Agg(

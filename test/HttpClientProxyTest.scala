@@ -121,16 +121,16 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 		//		} yield dom
 		val prg = for {
 			client <- ZIO.serviceWith[Client](_.uri(new URI(apifyUrl))
-				.proxy(Proxy(url"socks://$proxyHost:$proxyPort")) // DOES NOT WORK
+				//.proxy(Proxy(url"socks://$proxyHost:$proxyPort")) // DOES NOT WORK
 				.batched)
 			r <- client(Request(method = GET))
 		} yield r.body.asString
 
 		Unsafe.unsafe { implicit unsafe =>
-			Runtime.default.unsafe.run {
+			Runtime.default.unsafe.runToFuture {
 					prg.provide(Client.default)
 				}
-				.getOrThrowFiberFailure mustBe expectedIP
+				.map(_ mustBe expectedIP)
 		}
 	}
 
@@ -230,7 +230,7 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 
 	}
 
-	"http4s" in {
+	"http4s" in { // OK
 		import cats.effect.IO
 		import cats.effect.unsafe.implicits._
 		import org.http4s.netty.client.Socks5
@@ -251,14 +251,14 @@ class HttpClientProxyTest extends AsyncWordSpec with Matchers with ScalaFutures 
 		import play.shaded.ahc.org.asynchttpclient._
 		import play.api.libs.ws._
 		import play.api.test.WsTestClient
-		import scala.compat.java8.FutureConverters._
+/*		import scala.compat.java8.FutureConverters._
 		import java.util.concurrent.{Future => JavaFuture}
 
 		val asyncHttpClient = Dsl.asyncHttpClient( new DefaultAsyncHttpClientConfig.Builder()
 			.setProxyServer(new ProxyServer.Builder(proxyHost, proxyPort).setProxyType(ProxyType.SOCKS_V4))
 			.setMaxRequestRetry(0)
 			.setShutdownQuietPeriod(0)
-			.setShutdownTimeout(0))
+			.setShutdownTimeout(0))*/
 		//val req = asyncHttpClient.prepareGet(apifyUrl).execute
 		WsTestClient.withClient { cli: WSClient =>
 			//val underlying = cli.underlying.asInstanceOf[AsyncHttpClient]

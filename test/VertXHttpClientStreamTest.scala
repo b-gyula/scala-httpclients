@@ -15,8 +15,9 @@ import org.scalatest
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.matchers.must.Matchers
 import org.scalatest.wordspec.AsyncWordSpec
-import zio.{Runtime, Task}
+import play.api.Logging
 import zio.stream.ZSink
+import zio.{Runtime, Task}
 
 import java.io.InputStream
 import java.nio.charset.StandardCharsets.UTF_8
@@ -28,25 +29,34 @@ import scala.jdk.FunctionConverters._
 import scala.language.{implicitConversions, postfixOps}
 import scala.util.Try
 
-trait StreamTest {
+trait StreamTest extends Logging {
 	val expSize = 16035
 	val fileTimeFmt = new SimpleDateFormat("yy-MM-dd_HH.mm.ss")
+	val proxyHost = "127.0.0.1"
+
 	def checkSize(r: Result) = {
 		println (r.Data.size)
 		scalatest.Assertions.assert(r.Data.size >= expSize)
 	}
 
-	def logFileName: String = this.getClass.getSimpleName + "_cryptoCompareCoinList@" + fileTimeFmt.format(new Date()) + ".json"
+	def logFileName(ins: String): String = "log/" + this.getClass.getSimpleName +
+														s"_CCCList-$ins@${fileTimeFmt.format(new Date())}.json"
 
-	def unsafeRunSync[T](task: Task[T])(implicit runtime: Runtime[Any]) =
+	def unsafeRunSync[T](task: Task[T])(implicit runtime: Runtime[Any] = zio.Runtime.default) =
 		zio.Unsafe.unsafe { implicit u =>
 			runtime.unsafe.run(task).getOrThrowFiberFailure
 		}
+
+	def unsafeRunFuture[T](task: Task[T])(implicit runtime: Runtime[Any] = zio.Runtime.default) =
+		zio.Unsafe.unsafe { implicit u =>
+			runtime.unsafe.runToFuture(task)
+		}
 }
 
-object VertXHttpClientStreamTest extends StreamTest {
+object VertXHttpClientStreamTest extends StreamTest{
 	import Endpoint._
 	import scala.concurrent.ExecutionContext.Implicits.global
+
 	val cryptoCompareCoinListUri = "https://min-api.cryptocompare.com/data/all/coinlist"
 
 	def printResult(b: Buffer): Unit = println(b.toString("UTF-8"))
@@ -54,35 +64,66 @@ object VertXHttpClientStreamTest extends StreamTest {
 	val proxyOptions = ProxyOptions("127.0.0.1", port = 1080, `type` = SOCKS5)
 
 	implicit class AsyncResultOps[T](a: AsyncResult[T]) {
-		def asFuture: Future[T] = if(a.succeeded) Future.successful(a.result) else Future.failed(a.cause)
+		def asFuture: Future[T] = if (a.succeeded) Future.successful(a.result) else Future.failed(a.cause)
 	}
 
 	//implicit def asyncToFuture[T](a: AsyncResult[T]): Future[T] = a.asFuture
 	implicit def funcToHandler[T](f: AsyncResult[T] => Unit): Handler[AsyncResult[T]] =
 		(event: AsyncResult[T]) => f(event)
 
-	implicit class futureMapCorrect[T](f: VertxFuture[T] ) {
-		def mapWith[U](mapper: T => U): VertxFuture[U] = f.map( mapper.asJava).asInstanceOf[VertxFuture[U]]
+	implicit class futureMapCorrect[T](f: VertxFuture[T]) {
+		def map2[U](mapper: T => U): VertxFuture[U] = f.map(mapper.asJava).asInstanceOf[VertxFuture[U]]
 	}
+	val vertx = Vertx.vertx
 
-	val client = Vertx.vertx.createHttpClient(HttpClientOptions())
+	lazy val client = vertx.createHttpClient(HttpClientOptions())
 
-	def getFut: Future[(HttpClientResponse, Result)] = {
-		val stream = new WriteToInputStream(Vertx.vertx)
-		val resp = client.request(RequestOptions(cryptoCompareCoinListUri))
-			.compose { _.send.expecting(SC_OK) }
-			.compose { r => r.pipeTo(stream).mapWith{_ => r} }.asScala
-		def parse = Future {
+	def response = client.request(RequestOptions(cryptoCompareCoinListUri))
+		.compose {	_.send.expecting(SC_OK)	}
+
+	def futureWriteToInputStream: Future[(HttpClientResponse, Result)] = {
+		val stream = new WriteToInputStream(vertx)
+
+		val resp = response.compose { r => r.pipeTo(stream).map2( _ => r ) }.asScala
+
+		def parse = Future {// blocking{
 			readFromStream(stream)
 		}
-		resp.zip(parse)// Running them parallel avoids reading everything into the memory
+
+		resp.zip(parse) // Running them parallel avoids reading everything into the memory
 	}
 
-	def main(args: Array[String]): Unit = {
-		Await.ready(getFut.map {
-			case (resp, r) => println(r.Data.size)}
-			, 5 second)
+	def vertxFutureWriteToInputStream: Future[(HttpClientResponse, Result)] = {
+		import io.vertx.core.Future.{all, future}
+		val stream = new WriteToInputStream(vertx)
+		val resp = response.compose { r => r.pipeTo(stream).map2 { _ => r } }
+
+		def parse = future { p: VertxPromise[Result] =>
+			p.complete( readFromStream(stream) )
+		}
+		all(resp, parse)
+			.map2{ cf => (cf.resultAt(0), cf.resultAt(1)) }
 	}
+
+	def logResult(r: Result) = logger.debug("Count:" + r.Data.size)
+
+	def main(args: Array[String]): Unit = Await.ready(
+		if (args.length > 0) {
+			args(0) match {
+				case "z" =>	unsafeRunFuture(withZIO.useWriteToInputStream).flatMap {	case (_, r) => logResult(r)
+					vertx.close
+				}
+				case "v" => vertxFutureWriteToInputStream
+			}
+		}
+		else {
+			futureWriteToInputStream
+/*			response.compose(_.body).map2 { b =>
+			println(b.length)
+		}.compose(_ => vertx.close)*/
+		//vertx.setTimer(5000, )
+		}, 5 second)
+
 
 	object withZIO {
 		import zio._
@@ -90,7 +131,7 @@ object VertXHttpClientStreamTest extends StreamTest {
 		val createReq = ZIO.fromCompletionStage(
 			client.request(RequestOptions(cryptoCompareCoinListUri)).toCompletionStage )
 
-		def parse(is: InputStream) = ZIO.attempt {
+		def parse(is: InputStream) = ZIO.attemptBlocking {
 			readFromStream(is)
 		}
 
@@ -102,7 +143,7 @@ object VertXHttpClientStreamTest extends StreamTest {
 		}
 
 		def useWriteToInputStream = {
-			val stream = ZIO.acquireRelease(	ZIO.succeed( new WriteToInputStream(Vertx.vertx) ))(
+			val stream = ZIO.acquireRelease(	ZIO.succeed( new WriteToInputStream(vertx) ))(
 				rws => ZIO.attemptBlocking(rws.close).orDie)
 			ZIO.scoped {
 				for {
@@ -110,9 +151,29 @@ object VertXHttpClientStreamTest extends StreamTest {
 					req <- createReq
 					//resp <- send(req)
 					//r <- pipeTo(resp, strm) &> res(strm)
-					r <- sendNPipe(req, strm) &> parse(strm)
-				} yield r
+					r <- sendNPipe(req, strm) <&> parse(strm)
+				} yield  r
 			}
+		}
+
+
+		def asyncCallback = {
+			import zio.stream._
+			def send(r: HttpClientRequest) = ZIO.fromCompletionStage(
+				r.send().toCompletionStage
+			)
+			//ZStream.async()
+			ZIO.scoped {
+				for {
+					req <- createReq
+					resp	<- send(req)
+					//is <- resp.handler()
+				} yield ()
+			}
+		}
+
+		def main(args: Array[String]): Unit = {
+			unsafeRunSync(useWriteToInputStream)
 		}
 	}
 }
@@ -145,7 +206,7 @@ class VertXHttpClientStreamTest extends AsyncWordSpec with Matchers with ScalaFu
 
 	/* WriteToInputStream collects vertx`Buffer`s as is while not read uses CountDownLatch for wait */
 	"WriteToInputStream" in { // OK !!!!
-		getFut.map { // Running them parallel avoids reading everything into the memory
+		futureWriteToInputStream.map { // Running them parallel avoids reading everything into the memory
 			case (resp, r) => //println(r)
 				checkSize( r)
 		}
@@ -228,67 +289,63 @@ class VertXHttpClientStreamTest extends AsyncWordSpec with Matchers with ScalaFu
 	}
 
 	"ZIO" must {
-		import zio.Runtime.default._
-		import zio._
 		import withZIO._
+		import zio._
+
 		"ZStream" in { //
-			get(cryptoCompareCoinListUri + "", logFileName)
+			get(cryptoCompareCoinListUri + "", logFileName("ZStream"))
 				.map { checkSize }
 		}
 
-		"sttp adapter" ignore { // DOES NOT WORK!!!
+		"sttp adapter" in { // DOES NOT WORK!!!
 			import sttp.tapir.server.vertx.zio.VertxZioServerOptions.default
 			import sttp.tapir.server.vertx.zio.streams.zioReadStreamCompatible
 			val rs = zioReadStreamCompatible(default)(Runtime.default)
 			def send(r: HttpClientRequest) =  ZIO.fromCompletionStage(
-				r.send.expecting(SC_OK).toCompletionStage )
-			Unsafe.unsafe { implicit u =>
-				unsafe.runToFuture {
-					ZIO.scoped {
-						for {
-							req <- createReq
-							resp <- send(req)
-							is <- rs.fromReadStream(resp, None)
-										.tapSink(ZSink.fromFileName(logFileName))
-										.toInputStream
-							r <- parse(is) <& ZIO.fromCompletionStage(resp.end.toCompletionStage)
-						} yield r
-					}
+				r.send.toCompletionStage )
+			unsafeRunFuture {
+				ZIO.scoped {
+					for {
+						req <- createReq
+						resp <- send(req)
+						is <- rs.fromReadStream(resp, None)
+									.tapSink(ZSink.fromFileName(logFileName("sttp_adapter")))
+									.toInputStream
+						r <- parse(is) <& ZIO.fromCompletionStage(resp.end.toCompletionStage)
+					} yield r
 				}
 			}.map{ checkSize }
 		}
 
 		// UNSTABLE!!!
 		// Best: low memory: max 4 buffer(8K),  scala-jsoniter `readFromStream` waits in ZIO
-		"through reactive stream" in {
+		"ReactiveWriteStream" in {
 			import io.vertx.ext.reactivestreams.ReactiveWriteStream
 			import zio.interop.reactivestreams._
 			val rwsZIO = ZIO.acquireRelease(	ZIO.succeed( ReactiveWriteStream.writeStream[Buffer](Vertx.vertx) ))(
 				rws => ZIO.attemptBlocking(rws.close).orDie)
 			val sb = new StringBuilder
-			Unsafe.unsafe { implicit u =>
-				unsafe.runToFuture {
-					ZIO.scoped {
-						for {
-							rws <- rwsZIO
-							req <- createReq
-							is <- rws.toZIOStream(2) // Max 2 buffer -> low memory
-								/*.mapConcatChunk { b =>
-									val bb = b.asInstanceOf[BufferImpl].byteBuf
-									println(s"arrayOffset: ${bb.arrayOffset}, readerIndex: ${bb.readerIndex}, writerIndex: ${bb.writerIndex}, array len: ${bb.array.length}, ${bb}")
-									Chunk.ByteArray(bb.array, bb.arrayOffset, bb.array.length - bb.arrayOffset)
-								} */// No copy but has header also
-								.mapConcatChunk {
-									b =>
-										if (b.length() < 1) println("WARNING: 0 length:" + b.toString(UTF_8))
-										sb ++= "," + b.length
-										Chunk.fromArray(b.getBytes) // Makes copy!!
-								}
-								.tapSink(ZSink.fromFileName(logFileName))
-								.toInputStream
-							r <- sendNPipe(req, rws) <&> parse(is)
-						} yield r
-					}
+			unsafeRunFuture {
+				ZIO.scoped {
+					for {
+						rws <- rwsZIO
+						req <- createReq
+						is <- rws.toZIOStream(2) // Max 2 buffer -> low memory
+							/*.mapConcatChunk { b =>
+								val bb = b.asInstanceOf[BufferImpl].byteBuf
+								println(s"arrayOffset: ${bb.arrayOffset}, readerIndex: ${bb.readerIndex}, writerIndex: ${bb.writerIndex}, array len: ${bb.array.length}, ${bb}")
+								Chunk.ByteArray(bb.array, bb.arrayOffset, bb.array.length - bb.arrayOffset)
+							} */// No copy but has header also
+							.mapConcatChunk {
+								b =>
+									if (b.length() < 1) logger.error("WARNING: 0 length:" + b.toString(UTF_8))
+									sb ++= "," + b.length
+									Chunk.fromArray(b.getBytes) // Makes copy!!
+							}
+							.tapSink(ZSink.fromFileName(logFileName("ReactiveWriteStream")))
+							.toInputStream
+						r <- sendNPipe(req, rws) <&> parse(is)
+					} yield r
 				}
 			}.transform{t:Try[_] => println("Sizes:" + sb.result);t}.map {case (_, r: Result) =>	checkSize (r) }
 		}
@@ -299,11 +356,9 @@ class VertXHttpClientStreamTest extends AsyncWordSpec with Matchers with ScalaFu
 					 r.pipeTo(stream).toCompletionStage // Has to go together with send
 			)
 */
-			Unsafe.unsafe { implicit u =>
-				unsafe.runToFuture {
-					useWriteToInputStream
-				}
-			}.map{ checkSize }
+			unsafeRunFuture {
+				useWriteToInputStream
+			}.map{ case (_,r ) => checkSize(r) }
 		}
 
 		"InputStreamAdapter" ignore {
@@ -313,16 +368,13 @@ class VertXHttpClientStreamTest extends AsyncWordSpec with Matchers with ScalaFu
 				.compose { _.send.expecting(SC_OK) }.toCompletionStage
 			)
 			def res(r: HttpClientResponse) = ZIO.attemptBlocking {
-				println("#result")
 				readFromStream(new InputStreamAdapter(r))
 			}
-			Unsafe.unsafe { implicit u =>
-				unsafe.runToFuture {
-					for {
-						re <- resp.debug
-						r <- res(re) <& ZIO.fromCompletionStage(re.end.toCompletionStage)
-					} yield r //expected '{', offset: 0x00000000, buf: "IsUsedInNft":0,
-				}
+			unsafeRunFuture {
+				for {
+					re <- resp.debug
+					r <- res(re) <& ZIO.fromCompletionStage(re.end.toCompletionStage)
+				} yield r //expected '{', offset: 0x00000000, buf: "IsUsedInNft":0,
 			}.map{ checkSize }
 		}
 	}
